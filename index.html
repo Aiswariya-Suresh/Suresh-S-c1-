@@ -1,6 +1,225 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+    <script>
+        (function lockTheme() {
+  'use strict';
+
+  const LOCK_ID = 'theme-lock-style';
+  const LOCKED_THEME = {
+    // put your locked values here
+    '--bg': '#ffffff',
+    '--fg': '#111111',
+    '--primary': '#0b63ff',
+    'color': '#111111',
+    'background-color': '#ffffff'
+  };
+  const LOCK_CSS = `
+    :root { color-scheme: light !important; }
+    html, body {
+      color: ${LOCKED_THEME.color} !important;
+      background-color: ${LOCKED_THEME['background-color']} !important;
+      -webkit-text-size-adjust: 100% !important;
+    }
+    /* force common semantic elements */
+    body, html, #root, main {
+      background: ${LOCKED_THEME['background-color']} !important;
+      color: ${LOCKED_THEME.color} !important;
+    }
+    /* override CSS variables on :root */
+    :root {
+      ${Object.entries(LOCKED_THEME).map(([k,v]) => `${k}: ${v} !important;`).join('\n')}
+    }
+    /* neutralize common theme class selectors */
+    .dark, html.dark, body.dark, [data-theme="dark"] { all: unset !important; }
+    .light, html.light, body.light, [data-theme="light"] { all: unset !important; }
+    /* ensure links/buttons remain visible */
+    a, button, input, textarea, select { color: inherit !important; background: transparent !important; border-color: currentColor !important; }
+  `;
+
+  // 1) Insert or re-insert the lock style as early as possible
+  function ensureLockStyle() {
+    let s = document.getElementById(LOCK_ID);
+    if (!s) {
+      s = document.createElement('style');
+      s.id = LOCK_ID;
+      s.textContent = LOCK_CSS;
+      // Add to head or documentElement to maximize priority
+      (document.head || document.documentElement).appendChild(s);
+    } else if (s.textContent !== LOCK_CSS) {
+      s.textContent = LOCK_CSS;
+    }
+  }
+
+  // 2) Forcefully prevent changes to attributes commonly used to toggle theme
+  const origSetAttribute = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function(name, value) {
+    const n = String(name).toLowerCase();
+    if ((this === document.documentElement || this === document.body) &&
+        (n === 'class' || n === 'data-theme' || n === 'theme')) {
+      // ignore theme-class changes
+      return;
+    }
+    return origSetAttribute.apply(this, arguments);
+  };
+
+  // also prevent direct classList operations on html/body for theme toggles
+  const origClassListAdd = DOMTokenList.prototype.add;
+  const origClassListRemove = DOMTokenList.prototype.remove;
+  DOMTokenList.prototype.add = function() {
+    try {
+      const owner = this.ownerElement || this._ownerElement || null;
+      if ((owner === document.documentElement || owner === document.body) &&
+          Array.from(arguments).some(cls => /(^|\s)(dark|light|theme|night|day)($|\s)/i.test(cls))) {
+        return;
+      }
+    } catch (e) {}
+    return origClassListAdd.apply(this, arguments);
+  };
+  DOMTokenList.prototype.remove = function() {
+    try {
+      const owner = this.ownerElement || this._ownerElement || null;
+      if ((owner === document.documentElement || owner === document.body) &&
+          Array.from(arguments).some(cls => /(^|\s)(dark|light|theme|night|day)($|\s)/i.test(cls))) {
+        return;
+      }
+    } catch (e) {}
+    return origClassListRemove.apply(this, arguments);
+  };
+
+  // 3) Override window.matchMedia so CSS media queries can't detect user's preference and flip
+  try {
+    const realMatchMedia = window.matchMedia.bind(window);
+    window.matchMedia = function(query) {
+      // if it's prefers-color-scheme, return "light" forced result
+      if (/prefers-color-scheme\s*:\s*dark/i.test(query)) {
+        return {
+          matches: false,
+          media: query,
+          onchange: null,
+          addListener: function() {},
+          removeListener: function() {},
+          addEventListener: function() {},
+          removeEventListener: function() {},
+          dispatchEvent(){return false;}
+        };
+      }
+      if (/prefers-color-scheme\s*:\s*light/i.test(query)) {
+        return {
+          matches: true,
+          media: query,
+          onchange: null,
+          addListener: function() {},
+          removeListener: function() {},
+          addEventListener: function() {},
+          removeEventListener: function() {},
+          dispatchEvent(){return false;}
+        };
+      }
+      return realMatchMedia(query);
+    };
+  } catch (e) {
+    // some environments disallow overriding, ignore
+  }
+
+  // 4) Block attempts to insert CSS rules that target theme selectors
+  try {
+    const cssBlacklist = [/\.dark\b/, /html\.dark/, /:root\s*--/, /\[data-theme=("|')?dark("|')?\]/, /prefers-color-scheme/];
+    const OrigInsertRule = CSSStyleSheet.prototype.insertRule;
+    CSSStyleSheet.prototype.insertRule = function(rule, index) {
+      try {
+        for (const re of cssBlacklist) if (re.test(rule)) return index || 0;
+      } catch (e) {}
+      return OrigInsertRule.apply(this, arguments);
+    };
+    const OrigDeleteRule = CSSStyleSheet.prototype.deleteRule;
+    CSSStyleSheet.prototype.deleteRule = function(index) {
+      // allow deletions
+      return OrigDeleteRule.apply(this, arguments);
+    };
+  } catch (e) {}
+
+  // 5) Proxy localStorage/sessionStorage to prevent theme writes (common libs store theme key)
+  function proxyStorage(storage, keysToBlock = ['theme', 'color-scheme', 'site-theme', 'preferredTheme']) {
+    try {
+      const origSet = storage.setItem.bind(storage);
+      storage.setItem = function(k, v) {
+        if (keysToBlock.includes(String(k))) return;
+        return origSet(k, v);
+      };
+      const origRemove = storage.removeItem.bind(storage);
+      storage.removeItem = function(k) {
+        if (keysToBlock.includes(String(k))) return;
+        return origRemove(k);
+      };
+    } catch (e) {}
+  }
+  proxyStorage(window.localStorage || {}, ['theme', 'color-scheme', 'site-theme', 'preferredTheme']);
+  proxyStorage(window.sessionStorage || {}, ['theme', 'color-scheme', 'site-theme', 'preferredTheme']);
+
+  // 6) Reapply lock when DOM changes; observe head and html/body attr changes
+  const mo = new MutationObserver((mutations) => {
+    let reapply = false;
+    for (const m of mutations) {
+      // if any stylesheet/node added/removed or attributes changed on html/body — reapply
+      if (m.type === 'childList') {
+        reapply = true;
+        break;
+      }
+      if (m.type === 'attributes' && (m.target === document.documentElement || m.target === document.body)) {
+        reapply = true;
+        break;
+      }
+    }
+    if (reapply) ensureLockStyle();
+  });
+
+  function startObserver() {
+    try {
+      mo.observe(document.documentElement || document, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'data-theme'] });
+      if (document.head) mo.observe(document.head, { childList: true, subtree: true });
+    } catch (e) {}
+  }
+
+  // 7) Prevent inline style modifications to documentElement/body that attempt to change color/background
+  const origStyleSet = CSSStyleDeclaration.prototype.setProperty;
+  CSSStyleDeclaration.prototype.setProperty = function(prop, value, priority) {
+    try {
+      const p = String(prop).toLowerCase();
+      if ((this === document.documentElement.style || this === document.body.style) &&
+          (p === 'background' || p === 'background-color' || p === 'color' || p === '--bg' || p === '--fg')) {
+        // ignore
+        return;
+      }
+    } catch (e) {}
+    return origStyleSet.apply(this, arguments);
+  };
+
+  // 8) Immediately ensure style and start observing
+  ensureLockStyle();
+  startObserver();
+
+  // 9) Re-assert lock periodically as a last-resort (tiny interval)
+  const intervalId = setInterval(() => ensureLockStyle(), 1500);
+  // Provide a way to stop only if necessary (not exposed by default)
+  window.__releaseThemeLock = function() {
+    try { clearInterval(intervalId); mo.disconnect(); } catch (e) {}
+    // restore modified prototypes is omitted for brevity — this function is an emergency escape only
+    const s = document.getElementById(LOCK_ID);
+    if (s) s.remove();
+  };
+
+  // 10) Listen for storage or custom theme events and ignore them
+  window.addEventListener('storage', (e) => {
+    if (/(theme|color-scheme|site-theme|preferredTheme)/i.test(e.key || '')) {
+      // re-assert
+      ensureLockStyle();
+    }
+  }, true);
+
+  // done
+})();
+    </script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Suresh S - Area Sales Manager</title>
